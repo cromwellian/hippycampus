@@ -1,3 +1,5 @@
+[![MseeP Badge](https://mseep.net/pr/cromwellian-hippycampus-badge.jpg)](https://mseep.ai/app/cromwellian-hippycampus)
+
 
 # Hippycampus
 
