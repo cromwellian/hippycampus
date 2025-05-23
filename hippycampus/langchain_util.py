@@ -1,145 +1,89 @@
-from typing import Sequence, Union, List
+# -*- coding: utf-8 -*-
+"""
+Langchain utility functions and custom classes.
+
+This module provides helper functions and custom classes to integrate with or extend
+Langchain functionalities, particularly for creating and parsing agent responses.
+"""
+from typing import Sequence, Union, List, Callable, Any, Dict 
+import json 
 
 from langchain.agents import AgentOutputParser
-from langchain.agents.format_scratchpad import format_log_to_str
+from langchain.agents.format_scratchpad import format_log_to_str # type: ignore
 from langchain_core.agents import AgentAction, AgentFinish
 from langchain_core.exceptions import OutputParserException
 from langchain_core.language_models import BaseLanguageModel
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable, RunnablePassthrough
 from langchain_core.tools import BaseTool, ToolsRenderer, render_text_description_and_args
-from langchain_core.utils.json import parse_json_markdown
 
 
 def fixed_create_structured_chat_agent(
         llm: BaseLanguageModel,
         tools: Sequence[BaseTool],
         prompt: ChatPromptTemplate,
-        tools_renderer: ToolsRenderer = render_text_description_and_args,
+        tools_renderer: ToolsRenderer = render_text_description_and_args, # type: ignore
         *,
         stop_sequence: Union[bool, List[str]] = True,
-) -> Runnable:
-    """Create an agent aimed at supporting tools with multiple inputs.
+) -> Runnable[Dict[str, Any], Union[AgentAction, AgentFinish]]: 
+    """
+    Create an agent tailored for structured chat environments with multi-input tools.
+
+    This function adapts Langchain's standard agent creation to better support
+    tools that require multiple inputs, often represented as a JSON blob or dictionary.
+    It ensures that the prompt is correctly formatted and that the output parser
+    can handle the structured JSON output from the LLM.
 
     Args:
-        llm: LLM to use as the agent.
-        tools: Tools this agent has access to.
-        prompt: The prompt to use. See Prompt section below for more.
-        stop_sequence: bool or list of str.
-            If True, adds a stop token of "Observation:" to avoid hallucinates.
-            If False, does not add a stop token.
-            If a list of str, uses the provided list as the stop tokens.
-
-            Default is True. You may to set this to False if the LLM you are using
-            does not support stop sequences.
-        tools_renderer: This controls how the tools are converted into a string and
-            then passed into the LLM. Default is `render_text_description`.
+        llm: The language model (LLM) to be used as the core of the agent.
+        tools: A sequence of `BaseTool` instances that the agent can use.
+        prompt: The `ChatPromptTemplate` to guide the agent's reasoning and responses.
+                It must include 'tools', 'tool_names', and 'agent_scratchpad'
+                input variables.
+        tools_renderer: A function responsible for rendering the provided tools
+                        into a string format suitable for inclusion in the prompt.
+                        Defaults to `render_text_description_and_args`.
+        stop_sequence: Determines the stop sequence for the LLM.
+                       If True (default), uses "\\nObservation:" to prevent hallucination.
+                       If False, no stop sequence is added.
+                       If a list of strings, those strings are used as stop sequences.
 
     Returns:
-        A Runnable sequence representing an agent. It takes as input all the same input
-        variables as the prompt passed in does. It returns as output either an
-        AgentAction or AgentFinish.
+        A `Runnable` object representing the configured agent. This runnable takes
+        a dictionary as input (matching the prompt's input variables) and
+        outputs either an `AgentAction` (if a tool is to be called) or an
+        `AgentFinish` (if the agent provides a final answer).
 
-    Examples:
+    Raises:
+        ValueError: If the provided `prompt` is missing any of the required
+                    input variables (`tools`, `tool_names`, `agent_scratchpad`).
 
-        .. code-block:: python
+    Example (from Langchain documentation, adapted for this function):
+        ```python
+        from langchain_core.prompts import ChatPromptTemplate
+        from langchain.agents import AgentExecutor
+        from langchain_community.chat_models import ChatOpenAI # Or other LLM
+        from hippycampus.langchain_util import fixed_create_structured_chat_agent
 
-            from langchain import hub
-            from langchain_community.chat_models import ChatOpenAI
-            from langchain.agents import AgentExecutor, create_structured_chat_agent
+        # Assume 'tools' are defined elsewhere (e.g., loaded via OpenAPI)
+        # prompt = hub.pull("hwchase17/structured-chat-agent") # Example prompt
+        # For a custom prompt, ensure it has 'tools', 'tool_names', 'agent_scratchpad'
+        prompt = ChatPromptTemplate.from_messages(...) # Define your prompt
+        llm = ChatOpenAI(model="gpt-3.5-turbo")
 
-            prompt = hub.pull("hwchase17/structured-chat-agent")
-            model = ChatOpenAI()
-            tools = ...
+        agent = fixed_create_structured_chat_agent(llm, tools, prompt)
+        agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
 
-            agent = create_structured_chat_agent(model, tools, prompt)
-            agent_executor = AgentExecutor(agent=agent, tools=tools)
-
-            agent_executor.invoke({"input": "hi"})
-
-            # Using with chat history
-            from langchain_core.messages import AIMessage, HumanMessage
-            agent_executor.invoke(
-                {
-                    "input": "what's my name?",
-                    "chat_history": [
-                        HumanMessage(content="hi! my name is bob"),
-                        AIMessage(content="Hello Bob! How can I assist you today?"),
-                    ],
-                }
-            )
-
-    Prompt:
-
-        The prompt must have input keys:
-            * `tools`: contains descriptions and arguments for each tool.
-            * `tool_names`: contains all tool names.
-            * `agent_scratchpad`: contains previous agent actions and tool outputs as a string.
-
-        Here's an example:
-
-        .. code-block:: python
-
-            from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-
-            system = '''Respond to the human as helpfully and accurately as possible. You have access to the following tools:
-
-            {tools}
-
-            Use a json blob to specify a tool by providing an action key (tool name) and an action_input key (tool input).
-
-            Valid "action" values: "Final Answer" or {tool_names}
-
-            Provide only ONE action per $JSON_BLOB, as shown:
-
-            ```
-            {{
-              "action": $TOOL_NAME,
-              "action_input": $INPUT
-            }}
-            ```
-
-            Follow this format:
-
-            Question: input question to answer
-            Thought: consider previous and subsequent steps
-            Action:
-            ```
-            $JSON_BLOB
-            ```
-            Observation: action result
-            ... (repeat Thought/Action/Observation N times)
-            Thought: I know what to respond
-            Action:
-            ```
-            {{
-              "action": "Final Answer",
-              "action_input": "Final response to human"
-            }}
-
-            Begin! Reminder to ALWAYS respond with a valid json blob of a single action. Use tools if necessary. Respond directly if appropriate. Format is Action:```$JSON_BLOB```then Observation'''
-
-            human = '''{input}
-
-            {agent_scratchpad}
-
-            (reminder to respond in a JSON blob no matter what)'''
-
-            prompt = ChatPromptTemplate.from_messages(
-                [
-                    ("system", system),
-                    MessagesPlaceholder("chat_history", optional=True),
-                    ("human", human),
-                ]
-            )
-    """  # noqa: E501
+        response = agent_executor.invoke({"input": "What is the weather in Paris?"})
+        print(response)
+        ```
+    """
     missing_vars = {"tools", "tool_names", "agent_scratchpad"}.difference(
         prompt.input_variables + list(prompt.partial_variables)
     )
     if missing_vars:
         raise ValueError(f"Prompt missing required variables: {missing_vars}")
 
-    # prompt.append(")
     prompt = prompt.partial(
         tools=tools_renderer(list(tools)),
         tool_names=", ".join([t.name for t in tools]),
@@ -150,7 +94,6 @@ def fixed_create_structured_chat_agent(
     else:
         llm_with_stop = llm
 
-    print(f"Prompt is {prompt.messages[0]}")
     agent = (
             RunnablePassthrough.assign(
                 agent_scratchpad=lambda x: format_log_to_str(x["intermediate_steps"]),
@@ -163,51 +106,119 @@ def fixed_create_structured_chat_agent(
 
 
 class FixedJSONAgentOutputParser(AgentOutputParser):
-    """Parses tool invocations and final answers in JSON format.
+    """
+    Parses the JSON output of an LLM to determine agent actions or final answers.
 
-    Expects output to be in one of two formats.
+    This parser is designed to handle JSON output that specifies a tool invocation
+    (an `AgentAction`) or a final response to the user (an `AgentFinish`).
+    It includes fixes for common issues, such as:
+    - LLMs returning a list of actions instead of a single action.
+    - Handling `null` or empty `action_input`.
+    - Ensuring dictionary `action_input` for "Final Answer" is correctly stringified.
 
-    If the output signals that an action should be taken,
-    should be in the below format. This will result in an AgentAction
-    being returned.
-
-    ```
+    Expected JSON structure for an `AgentAction`:
+    ```json
     {
-      "action": "search",
-      "action_input": "2+2"
+      "action": "tool_name",
+      "action_input": {"arg1": "value1", "arg2": "value2"}
+    }
+    ```
+    or
+    ```json
+    {
+      "action": "tool_name",
+      "action_input": "simple string input"
     }
     ```
 
-    If the output signals that a final answer should be given,
-    should be in the below format. This will result in an AgentFinish
-    being returned.
-
-    ```
+    Expected JSON structure for an `AgentFinish`:
+    ```json
     {
       "action": "Final Answer",
-      "action_input": "4"
+      "action_input": "The final response to the user."
+    }
+    ```
+    or
+    ```json
+    {
+      "action": "Final Answer",
+      "action_input": {"key": "structured response"}
     }
     ```
     """
 
     def parse(self, text: str) -> Union[AgentAction, AgentFinish]:
+        """
+        Parses the LLM's JSON output string.
+
+        Args:
+            text: The JSON string output from the LLM.
+
+        Returns:
+            An `AgentAction` if the LLM indicates a tool should be used,
+            or an `AgentFinish` if the LLM provides a final answer.
+
+        Raises:
+            OutputParserException: If the JSON cannot be parsed, or if essential
+                                   keys like "action" are missing.
+        """
         try:
+            # Use Langchain's utility to parse JSON that might be in a markdown code block
             response = parse_json_markdown(text)
+            
             if isinstance(response, list):
-                # gpt turbo frequently ignores the directive to emit a single action
-                # logger.warning("Got multiple action responses: %s", response)
-                response = response[0]
-            if response['action_input'] is None:
-                response['action_input'] = {}
-            if response["action"] == "Final Answer":
-                return AgentFinish({"output": response["action_input"]}, text)
-            else:
-                return AgentAction(
-                    response["action"], response.get("action_input", {}), text
-                )
-        except Exception as e:
-            raise OutputParserException(f"Could not parse LLM output: {text}") from e
+                # Handle cases where the LLM might (incorrectly) return a list of actions.
+                # The current implementation takes the first valid action.
+                if not response: 
+                    raise OutputParserException(f"LLM output was an empty list: {text}")
+                response = response[0] # Take the first action
+                if not isinstance(response, dict): # Ensure the first item is a dict
+                     raise OutputParserException(f"First item in LLM output list is not a JSON object: {response}")
+
+            if not isinstance(response, dict): # Ensure final response is a dict
+                raise OutputParserException(f"LLM output, after potential list processing, is not a JSON object: {response}")
+
+            action = response.get("action")
+            action_input = response.get("action_input")
+
+            if action is None:
+                raise OutputParserException(f"Missing 'action' key in LLM output dictionary: {response}")
+
+            if action == "Final Answer":
+                if action_input is None:
+                    output = ""  # Treat null input for Final Answer as empty string
+                elif isinstance(action_input, dict):
+                    # Stringify dictionary inputs for Final Answer as per common agent expectations
+                    output = json.dumps(action_input, ensure_ascii=False)
+                else:
+                    output = str(action_input)
+                return AgentFinish({"output": output}, text)
+            else: # It's an AgentAction
+                tool_input: Any 
+                if action_input is None:
+                    tool_input = "" 
+                elif isinstance(action_input, dict) and not action_input: 
+                    tool_input = "" # Empty dict also becomes empty string for some tool inputs
+                elif isinstance(action_input, (str, bool, int, float)): # Primitives are passed as is
+                    tool_input = action_input
+                elif isinstance(action_input, dict):
+                     # For structured tools, the dict is often the expected input.
+                     # For older tools, it might be stringified. Langchain's StructuredTool handles dicts.
+                    tool_input = action_input # Pass dicts as is
+                else: # Other types (e.g. list if not handled by schema) stringified
+                    tool_input = str(action_input)
+
+                return AgentAction(action, tool_input, text)
+        except json.JSONDecodeError as e: 
+            raise OutputParserException(
+                f"Could not parse LLM output as JSON: {text}. \nParsing error: {e}"
+            ) from e
+        except OutputParserException: # Re-raise specific OutputParserExceptions
+            raise
+        except Exception as e: # Catch any other unexpected errors during parsing
+            raise OutputParserException(f"Could not parse LLM output: {text}. \nUnexpected error: {e}") from e
 
     @property
     def _type(self) -> str:
-        return "json-agent"
+        """Identifies the type of this output parser for Langchain."""
+        return "json-agent-fixed" # Distinguish from standard JSONAgentOutputParser if needed

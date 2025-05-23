@@ -2,466 +2,605 @@ import asyncio
 import base64
 import json
 import os
-import tempfile
-import traceback
-from typing import Union
+import hashlib
+import inspect
+from typing import Union, List, Dict, Any, Optional
 
-import anyio
-import click
 import httpx
-import mcp.types as types
-from hippycampus.openapi_builder import load_tools_from_openapi, create_input_schema_from_json_schema
-from mcp.server.lowlevel import Server
+import logging
+from starlette.applications import Starlette
+from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.routing import Route
+
+from langchain_core.tools import BaseTool
+
+from hippycampus.openapi_builder import OpenAPIToolBuilder
+from hippycampus.tool_auth.authentication import AbstractAuth
+
+logger = logging.getLogger(__name__)
 
 
-async def fetch_website(
-        url: str,
-) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
+# --- Tool Registry Class ---
+class ToolRegistry:
+    """Encapsulates tool registration and management."""
+
+    def __init__(self):
+        self.langchain_tools: Dict[str, BaseTool] = {}
+        self.external_docs_for_tools: Dict[str, str] = {}
+        self.external_metadata_for_tools: Dict[str, Dict[str, Any]] = {}
+        logger.info("ToolRegistry initialized.")
+
+    def register_tool(
+        self,
+        name: str,
+        tool_instance: BaseTool,
+        docs_url: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
+        """Registers a tool with its documentation URL and metadata."""
+        if name in self.langchain_tools:
+            logger.warning(f"Tool '{name}' is being replaced in registry.")
+        self.langchain_tools[name] = tool_instance
+        if docs_url:
+            self.external_docs_for_tools[name] = docs_url
+        if metadata:
+            self.external_metadata_for_tools[name] = metadata
+        logger.info(
+            f"Tool '{name}' registered. Docs: {docs_url is not None}, Meta: {metadata is not None}"
+        )
+
+    def get_tool(self, name: str) -> Optional[BaseTool]:
+        return self.langchain_tools.get(name)
+
+    def get_external_doc_url(self, name: str) -> Optional[str]:
+        return self.external_docs_for_tools.get(name)
+
+    def get_external_metadata(self, name: str) -> Optional[Dict[str, Any]]:
+        return self.external_metadata_for_tools.get(name)
+
+    def list_tools_with_details(self) -> List[Dict[str, Any]]:
+        """Returns a list of all registered tools with their details."""
+        tool_list = []
+        for name, tool_instance in self.langchain_tools.items():
+            tool_info: Dict[str, Any] = {
+                "name": name,
+                "description": tool_instance.description,
+                "args_schema": tool_instance.args_schema.model_json_schema()
+                if tool_instance.args_schema
+                and hasattr(tool_instance.args_schema, "model_json_schema")
+                else None,
+            }
+            if name in self.external_docs_for_tools:
+                tool_info["external_doc_url"] = self.external_docs_for_tools[name]
+            if name in self.external_metadata_for_tools:
+                tool_info["external_metadata"] = self.external_metadata_for_tools[name]
+            tool_list.append(tool_info)
+        return tool_list
+
+
+# --- Helper Functions ---
+async def fetch_website(url: str) -> str:
+    """Fetches a website and returns its content as a string."""
     headers = {
         "User-Agent": "MCP Hippycampus Server (github.com/hippycampus/hippycampus)"
     }
-    async with httpx.AsyncClient(follow_redirects=True, headers=headers) as client:
-        response = await client.get(url)
-        response.raise_for_status()
-        return [types.TextContent(type="text", text=response.text)]
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, headers=headers) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            return response.text
+    except httpx.HTTPStatusError as e:
+        error_message = f"Error fetching website: Client error '{e.response.status_code} {e.response.reason_phrase}' for url '{e.request.url}'."
+        # Limit response preview to avoid overly long error messages
+        response_text_preview = e.response.text[:500] if e.response.text else ""
+        if response_text_preview:
+            error_message += f" Response: {response_text_preview}"
+        logger.error(error_message)
+        return error_message
+    except httpx.RequestError as e:
+        error_message = f"Request error for url '{e.request.url}': {e}"
+        logger.error(error_message)
+        return error_message
 
 
-external_docs_for_tools = {}
-external_metadata_for_tools = {}
-
-
-async def fetch_documentation_for_tool(tool_name: str) -> list[
-    Union[types.TextContent, types.ImageContent, types.EmbeddedResource]]:
-    tool_name = json.loads(tool_name)['tool_name']
-    url = external_docs_for_tools.get(tool_name, None)
-    metadata = external_metadata_for_tools.get(tool_name, None)
-    docs = []
-    if metadata is not None:
-        docs.append("Here are some examples of how to use this tool:\n")
-        for example in metadata.get('requestExamples', {}).values():
-            docs.append(f"Example Input: {example['value']}")
-        for status_code, examples in metadata.get('responseExamples', {}).items():
-            for example in examples.values():
-                docs.append(f"Example Response: {example['value']}")
+def encode_as_base64(data: Union[str, bytes]) -> str:
+    """Encode string or bytes content as a base64 string."""
+    if isinstance(data, str):
+        data_bytes = data.encode("utf-8")
     else:
-        docs.append("No external documentation available for this tool.")
-    # else:
-    #     content = await fetch_website(url)
-    #     docs.append(content[0].text)
-    return [types.TextContent(type="text", text="\n".join(docs))]
+        data_bytes = data
+    return base64.b64encode(data_bytes).decode("utf-8")
 
 
-async def load_openapi(request):
+def decode_base64(encoded_content: str) -> str:
+    """Decode base64 encoded content to string."""
+    try:
+        return base64.b64decode(encoded_content).decode("utf-8")
+    except (TypeError, base64.binascii.Error) as e:
+        logger.error(
+            f"Invalid base64 string for decoding: {encoded_content[:50]}... Error: {e}"
+        )  # Log part of content for context
+        raise ValueError("Invalid base64 string provided.")
+
+
+def compute_git_commit_sha(content: Union[str, bytes]) -> str:
+    """Compute SHA-1 hash for content."""
+    if isinstance(content, str):
+        content_bytes = content.encode("utf-8")
+    else:
+        content_bytes = content
+    sha1_hash = hashlib.sha1(content_bytes)
+    return sha1_hash.hexdigest()
+
+
+def fetch_documentation_for_tool(
+    tool_name: str,
+    langchain_tools_dict: Dict[str, BaseTool],
+    external_docs_dict: Dict[str, str],
+    external_metadata_dict: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
     """
-    Handle loading OpenAPI specifications from a URL or local file and register the tools.
-    The URL is specified as a query parameter 'url'.
-    If the URL starts with '/', it's treated as a local file path.
+    Fetches documentation and metadata for a given tool.
     """
-    url = request.query_params.get('url')
-    print(f"Loading OpenAPI from {url}")
-    token = request.query_params.get('token')  # Optional auth token
+    tool_instance = langchain_tools_dict.get(tool_name)
+    if not tool_instance:
+        raise ValueError(f"Tool '{tool_name}' not found for documentation retrieval.")
 
+    tool_info: Dict[str, Any] = {
+        "name": tool_instance.name,
+        "description": tool_instance.description,
+        "args_schema": tool_instance.args_schema.model_json_schema()
+        if tool_instance.args_schema
+        and hasattr(tool_instance.args_schema, "model_json_schema")
+        else None,
+    }
+    doc_url = external_docs_dict.get(tool_name)
+    if doc_url:
+        tool_info["external_doc_url"] = doc_url
+
+    metadata = external_metadata_dict.get(tool_name)
+    if metadata:
+        tool_info["external_metadata"] = metadata
+        examples_text_parts = []
+        request_examples = metadata.get("requestExamples", {})
+        if isinstance(request_examples, dict):  # Ensure it's a dict before iterating
+            for ex_name, ex_data in request_examples.items():
+                if isinstance(ex_data, dict):
+                    examples_text_parts.append(
+                        f"Example Input ({ex_name}): {json.dumps(ex_data.get('value'))}"
+                    )
+
+        response_examples = metadata.get("responseExamples", {})
+        if isinstance(response_examples, dict):
+            for status, resp_ex_map in response_examples.items():
+                if isinstance(resp_ex_map, dict):
+                    for ex_name, ex_data in resp_ex_map.items():
+                        if isinstance(ex_data, dict):
+                            examples_text_parts.append(
+                                f"Example Response ({status} - {ex_name}): {json.dumps(ex_data.get('value'))}"
+                            )
+        if examples_text_parts:
+            tool_info["examples_text"] = "\n".join(examples_text_parts)
+
+    return tool_info
+
+
+# --- Tool Registration and Loading (Refactored to use ToolRegistry via app.state) ---
+async def load_openapi(request: Request) -> JSONResponse:
+    """
+    Endpoint to load an OpenAPI specification from a URL (http/https or file)
+    and register the derived tools into the app's ToolRegistry.
+    """
+    url = request.query_params.get("url")
     if not url:
         return JSONResponse(
-            {"error": "Missing required query parameter 'url'"},
-            status_code=400
+            {
+                "error_type": "MissingParameter",
+                "message": "URL query parameter is required.",
+            },
+            status_code=400,
+        )
+
+    if not hasattr(request.app.state, "tool_registry") or not isinstance(
+        request.app.state.tool_registry, ToolRegistry
+    ):
+        logger.critical(
+            "ToolRegistry not found in app.state. This indicates a server misconfiguration."
+        )
+        return JSONResponse(
+            {
+                "error_type": "ServerConfigurationError",
+                "message": "ToolRegistry not available.",
+            },
+            status_code=500,
+        )
+
+    tool_registry: ToolRegistry = request.app.state.tool_registry
+    spec_content: Optional[str] = None
+    file_path_for_error: str = url  # Use URL in error messages unless it's a file path
+
+    try:
+        if url.startswith("file://"):
+            file_path = url[7:]
+            file_path_for_error = os.path.basename(
+                file_path
+            )  # For user-friendly error messages
+            if ".." in file_path or not os.path.isabs(file_path):
+                return JSONResponse(
+                    {
+                        "error_type": "InvalidFilePath",
+                        "message": "Invalid local file path provided.",
+                    },
+                    status_code=400,
+                )
+            if not os.path.exists(file_path):  # Check existence before opening
+                raise FileNotFoundError(
+                    f"Local OpenAPI spec file not found: {file_path_for_error}"
+                )
+            with open(file_path, "r", encoding="utf-8") as f:
+                spec_content = f.read()
+            logger.info(f"Loaded OpenAPI spec from local file: {file_path}")
+        else:
+            spec_content = await fetch_website(url)
+            if spec_content.startswith(
+                "Error fetching website"
+            ) or spec_content.startswith("Request error"):
+                raise httpx.RequestError(
+                    spec_content
+                )  # Let the specific exception handler below catch this
+            logger.info(f"Fetched OpenAPI spec from URL: {url}")
+
+        if not spec_content:
+            return JSONResponse(
+                {
+                    "error_type": "NoContent",
+                    "message": "Failed to retrieve OpenAPI spec content.",
+                },
+                status_code=400,
+            )
+
+        builder = OpenAPIToolBuilder(spec=spec_content)
+
+        auth_obj: Optional[AbstractAuth] = None
+        # Placeholder for auth resolution based on request.headers or other context
+        # Example: if hasattr(request.app.state, 'auth_resolver'):
+        # auth_header = request.headers.get("Authorization")
+        # if auth_header: auth_obj = request.app.state.auth_resolver.resolve(auth_header, url_being_loaded=url)
+
+        loaded_lc_tools = builder.build_tools(auth=auth_obj)
+
+        tools_loaded_info = []
+        for tool_instance in loaded_lc_tools:
+            docs_url = (
+                tool_instance.metadata.get("externalDocs", {}).get("url")
+                if tool_instance.metadata
+                else None
+            )
+            tool_registry.register_tool(
+                name=tool_instance.name,
+                tool_instance=tool_instance,
+                docs_url=docs_url,
+                metadata=tool_instance.metadata,
+            )
+            tools_loaded_info.append(
+                {
+                    "name": tool_instance.name,
+                    "description": tool_instance.description,
+                }
+            )
+
+        logger.info(
+            f"Successfully loaded and registered {len(tools_loaded_info)} tools from '{url}'."
+        )
+        return JSONResponse(
+            {
+                "message": "OpenAPI spec loaded and tools registered successfully.",
+                "tools_loaded": tools_loaded_info,
+            }
+        )
+
+    except FileNotFoundError as e:
+        logger.error(
+            f"FileNotFoundError in load_openapi for '{file_path_for_error}': {e}"
+        )
+        return JSONResponse(
+            {
+                "error_type": "FileNotFound",
+                "message": f"File not found: {file_path_for_error}.",
+            },
+            status_code=400,
+        )
+    except PermissionError as e:
+        logger.error(
+            f"PermissionError in load_openapi for '{file_path_for_error}': {e}"
+        )
+        return JSONResponse(
+            {
+                "error_type": "PermissionError",
+                "message": f"Permission denied for file operation: {file_path_for_error}.",
+            },
+            status_code=403,
+        )
+    except (
+        httpx.RequestError
+    ) as e:  # This will catch the re-raised error from fetch_website
+        logger.error(f"HTTP RequestError in load_openapi for URL '{url}': {e}")
+        return JSONResponse(
+            {
+                "error_type": "RequestError",
+                "message": f"Failed to fetch OpenAPI spec from URL: {url}. Detail: {str(e)}",
+            },
+            status_code=400,
+        )
+    except ValueError as e:
+        logger.error(
+            f"ValueError in load_openapi (spec parsing/tool building for '{url}'): {e}"
+        )
+        return JSONResponse(
+            {
+                "error_type": "SpecProcessingError",
+                "message": f"Failed to parse OpenAPI spec or build tools: {str(e)}",
+            },
+            status_code=400,
+        )
+    except Exception as e:
+        logger.error(
+            f"Unexpected error in load_openapi for URL '{url}': {e}", exc_info=True
+        )
+        return JSONResponse(
+            {
+                "error_type": "InternalServerError",
+                "message": "An unexpected error occurred while processing the OpenAPI specification.",
+            },
+            status_code=500,
+        )
+
+
+# --- Core Tool Dispatch Logic (Refactored to use ToolRegistry) ---
+async def fetch_tool_from_registry(
+    tool_name: str, arguments: Dict[str, Any], tool_registry: ToolRegistry
+) -> Any:
+    """
+    Fetches and executes a tool using the provided ToolRegistry.
+    Default tools are checked first, then dynamically loaded LangChain tools from the registry.
+    """
+    logger.info(f"Fetching tool: '{tool_name}' with arguments: {arguments}")
+
+    # Default tools (not in registry, handled by name)
+    if tool_name == "fetch":
+        url_to_fetch = arguments.get("url")
+        if not url_to_fetch or not isinstance(url_to_fetch, str):
+            raise ValueError(
+                "URL argument is required for fetch tool and must be a string."
+            )
+        return await fetch_website(url_to_fetch)
+    elif tool_name == "encode_as_base64":
+        data_to_encode = arguments.get("data")
+        if data_to_encode is None:  # Allow empty string, but None is invalid.
+            raise ValueError("Data argument is required for encode_as_base64 tool.")
+        return encode_as_base64(data_to_encode)
+    elif tool_name == "decode_base64":
+        data_to_decode = arguments.get("data")
+        if not data_to_decode or not isinstance(data_to_decode, str):
+            raise ValueError(
+                "Data argument is required for decode_base64 tool and must be a non-empty string."
+            )
+        return decode_base64(data_to_decode)  # Can raise ValueError if invalid base64
+    elif tool_name == "compute_git_commit_sha":
+        data_to_hash = arguments.get("data")
+        if data_to_hash is None:
+            raise ValueError(
+                "Data argument is required for compute_git_commit_sha tool."
+            )
+        return compute_git_commit_sha(data_to_hash)
+    elif tool_name == "fetch_documentation_for_tool":
+        doc_tool_name = arguments.get("tool_name")
+        if not doc_tool_name or not isinstance(doc_tool_name, str):
+            raise ValueError(
+                "tool_name argument is required for fetch_documentation_for_tool."
+            )
+
+        # Create temporary dicts for the helper as it expects them
+        temp_langchain_tools = (
+            {doc_tool_name: tool_registry.get_tool(doc_tool_name)}
+            if tool_registry.get_tool(doc_tool_name)
+            else {}
+        )
+        temp_docs = (
+            {doc_tool_name: tool_registry.get_external_doc_url(doc_tool_name)}
+            if tool_registry.get_external_doc_url(doc_tool_name)
+            else {}
+        )
+        temp_meta = (
+            {doc_tool_name: tool_registry.get_external_metadata(doc_tool_name)}
+            if tool_registry.get_external_metadata(doc_tool_name)
+            else {}
+        )
+        # fetch_documentation_for_tool itself raises ValueError if tool not in temp_langchain_tools
+        return fetch_documentation_for_tool(
+            doc_tool_name, temp_langchain_tools, temp_docs, temp_meta
+        )
+
+    tool_instance = tool_registry.get_tool(tool_name)
+    if not tool_instance:
+        raise ValueError(f"Tool '{tool_name}' not found in registry.")
+
+    logger.info(
+        f"Found dynamic tool in registry: '{tool_name}', type: {type(tool_instance)}"
+    )
+
+    try:
+        # Langchain tools handle input parsing via Pydantic args_schema when invoke/ainvoke is called.
+        # The `arguments` dict should contain keys matching the tool's args_schema.
+        if inspect.iscoroutinefunction(getattr(tool_instance, "ainvoke", None)):
+            logger.info(f"A-Invoking tool '{tool_name}' with input: {arguments}")
+            return await tool_instance.ainvoke(input=arguments)  # type: ignore
+        elif hasattr(tool_instance, "invoke"):
+            logger.info(
+                f"Invoking tool '{tool_name}' with input: {arguments} (sync in executor)"
+            )
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None, lambda: tool_instance.invoke(input=arguments)
+            )  # type: ignore
+        # Fallback for older/simpler tools if invoke/ainvoke are not standard.
+        elif inspect.iscoroutinefunction(tool_instance._arun):
+            logger.info(f"A-Running tool '{tool_name}' with kwargs: {arguments}")
+            return await tool_instance._arun(**arguments)
+        elif hasattr(tool_instance, "_run"):
+            logger.info(
+                f"Running tool '{tool_name}' with kwargs: {arguments} (sync in executor)"
+            )
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, tool_instance._run, **arguments)
+        else:
+            raise NotImplementedError(
+                f"Tool '{tool_name}' does not have a standard execution method (invoke, ainvoke, _run, _arun)."
+            )
+
+    except Exception as e:  # Catch execution errors from the tool itself
+        logger.error(
+            f"Error during execution of tool '{tool_name}': {e}", exc_info=True
+        )
+        # Re-raise to be caught by call_tool_endpoint for a 500 response.
+        # Or, could return a specific error structure if tools are expected to fail gracefully.
+        raise  # Let call_tool_endpoint handle the final JSON response
+
+
+# --- Starlette Application Setup ---
+async def on_startup():
+    """Initialize resources or load configurations when the app starts."""
+    logger.info("MCP Server starting up...")
+    app.state.tool_registry = ToolRegistry()
+    # Example: Register additional default tools or perform other setup
+    # from langchain_community.tools import WikipediaQueryRun
+    # from langchain_community.utilities import WikipediaAPIWrapper
+    # wikipedia_tool = WikipediaQueryRun(api_wrapper=WikipediaAPIWrapper())
+    # app.state.tool_registry.register_tool(wikipedia_tool.name, wikipedia_tool)
+
+
+async def on_shutdown():
+    """Clean up resources when the app shuts down."""
+    logger.info("MCP Server shutting down...")
+
+
+async def call_tool_endpoint(request: Request) -> JSONResponse:
+    """Endpoint to call a registered tool using the ToolRegistry from app.state."""
+    tool_name = request.path_params["tool_name"]
+    try:
+        payload = await request.json()
+        arguments = payload.get("arguments", {})
+        if not isinstance(arguments, dict):
+            return JSONResponse(
+                {
+                    "error_type": "InvalidPayload",
+                    "message": "Arguments must be a JSON object if provided.",
+                },
+                status_code=400,
+            )
+    except json.JSONDecodeError:
+        return JSONResponse(
+            {"error_type": "InvalidJSON", "message": "Invalid JSON payload."},
+            status_code=400,
         )
 
     try:
-        # Check if the URL is a local file path
-        if url.startswith('/'):
-            print(f"Loading local file: {url}")
-            # Load from local file system
-            try:
-                with open(url, 'r') as file:
-                    spec_content = file.read()
+        if not hasattr(request.app.state, "tool_registry"):
+            logger.critical(
+                "ToolRegistry not found in app.state during call_tool_endpoint. Server not configured correctly."
+            )
+            return JSONResponse(
+                {
+                    "error_type": "ServerConfigurationError",
+                    "message": "ToolRegistry not initialized.",
+                },
+                status_code=500,
+            )
 
-                # Create a temporary file for processing
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as temp_file:
-                    temp_file.write(spec_content)
-                    temp_path = temp_file.name
-            except FileNotFoundError:
-                return JSONResponse(
-                    {"error": f"Local file not found: {url}"},
-                    status_code=404
-                )
-            except PermissionError:
-                return JSONResponse(
-                    {"error": f"Permission denied when accessing file: {url}"},
-                    status_code=403
-                )
-        else:
-            # Fetch the OpenAPI specification from URL
-            headers = {
-                "User-Agent": "MCP Hippycampus Server (github.com/hippycampus/hippycampus)"
-            }
-            async with httpx.AsyncClient(follow_redirects=True, headers=headers) as client:
-                response = await client.get(url)
-                response.raise_for_status()
-                spec_content = response.text
-
-            # Save the spec to a temporary file
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as temp_file:
-                temp_file.write(spec_content)
-                temp_path = temp_file.name
-
-        try:
-            # Load tools from the OpenAPI spec
-            tools = load_tools_from_openapi(temp_path, token, url)
-
-            # Register each tool with the server
-            registered_tools = []
-            for tool in tools:
-                # Convert LangChain tool to MCP tool
-                mcp_tool = types.Tool(
-                    name=tool.name,
-                    description=tool.description,
-                    inputSchema=tool.args_schema.schema() if hasattr(tool, 'args_schema') else {
-                        "type": "object",
-                        "properties": {"input": {"type": "string"}},
-                        "required": ["input"]
-                    }
-                )
-                print(f"Tool metadata: {tool.metadata}")
-                if tool.metadata is not None and tool.metadata.get('externalDocs', None) is not None:
-                    externalDocs = tool.metadata.get('externalDocs', {})
-                    external_docs_for_tools[tool.name] = externalDocs.get('url', None) if isinstance(externalDocs,
-                                                                                                     dict) else externalDocs
-                    external_metadata_for_tools[tool.name] = tool.metadata
-
-                # Register the tool
-                request.app.state.register_tool(tool, mcp_tool)
-                registered_tools.append(mcp_tool.name)
-
-            return JSONResponse({
-                "status": "success",
-                "message": f"Successfully loaded {len(registered_tools)} tools from OpenAPI specification",
-                "tools": registered_tools
-            })
-        finally:
-            # Clean up the temporary file
-            os.unlink(temp_path)
-
-    except Exception as e:
+        tool_registry: ToolRegistry = request.app.state.tool_registry
+        result = await fetch_tool_from_registry(tool_name, arguments, tool_registry)
+        return JSONResponse({"result": result})
+    except ValueError as e:
+        logger.warning(f"ValueError in call_tool_endpoint for '{tool_name}': {e}")
+        error_type = (
+            "ToolNotFound" if "not found" in str(e).lower() else "InvalidArguments"
+        )
+        status_code = 404 if error_type == "ToolNotFound" else 400
         return JSONResponse(
-            {"error": f"Failed to load OpenAPI specification: {str(e)}"},
-            status_code=500
+            {"error_type": error_type, "message": str(e)}, status_code=status_code
+        )
+    except TypeError as e:
+        logger.warning(
+            f"TypeError in call_tool_endpoint for '{tool_name}' with args {arguments}: {e}"
+        )
+        return JSONResponse(
+            {
+                "error_type": "ArgumentTypeError",
+                "message": f"Invalid argument type or structure for tool '{tool_name}': {e}",
+            },
+            status_code=400,
+        )
+    except NotImplementedError as e:  # If a tool doesn't have a runnable method
+        logger.error(f"NotImplementedError for tool '{tool_name}': {e}", exc_info=True)
+        return JSONResponse(
+            {"error_type": "ToolNotRunnable", "message": str(e)}, status_code=501
+        )  # Not Implemented
+    except Exception as e:
+        logger.error(
+            f"Unexpected error executing tool '{tool_name}': {e}", exc_info=True
+        )
+        return JSONResponse(
+            {
+                "error_type": "ToolExecutionError",
+                "message": f"An internal error occurred while executing tool '{tool_name}'.",
+            },
+            status_code=500,
         )
 
 
-@click.command()
-@click.option("--port", default=8000, help="Port to listen on for SSE")
-@click.option(
-    "--transport",
-    type=click.Choice(["stdio", "sse"]),
-    default="stdio",
-    help="Transport type",
-)
-def main(port: int, transport: str) -> int:
-    print("Starting MCP server...")
-    app = Server("mcp-website-fetcher")
-
-    # Create a list to store dynamically registered tools
-    dynamic_tools = []
-    langchain_tools = {}  # Store LangChain tools by name
-
-    # Add the default fetch tool
-    default_tools = [
-        types.Tool(
-            name="encode_as_base64",
-            description="Encode content as a base64 string. Returns the encoded string as text.",
-            inputSchema={
-                "type": "object",
-                "required": ["content"],
-                "properties": {
-                    "content": {
-                        "oneOf": [
-                            {
-                                "type": "string",
-                                "description": "String content to encode (will be UTF-8 encoded)"
-                            },
-                            {
-                                "type": "object",
-                                "description": "Bytes-like object to encode"
-                            }
-                        ],
-                        "description": "the string or bytes content to encode",
-                    }
-                },
+async def list_tools_endpoint(request: Request) -> JSONResponse:
+    """Endpoint to list all available tools with their details from the ToolRegistry."""
+    if not hasattr(request.app.state, "tool_registry"):
+        logger.critical(
+            "ToolRegistry not found in app.state for listing tools. Server not configured correctly."
+        )
+        return JSONResponse(
+            {
+                "error_type": "ServerConfigurationError",
+                "message": "ToolRegistry not available.",
             },
-        ),
-        types.Tool(
-            name="decode_base64",
-            description="Decode base64 encoded content to string.",
-            inputSchema={
-                "type": "object",
-                "required": ["encoded_content"],
-                "properties": {
-                    "encoded_content": {
-                        "type": "string",
-                        "description": "The string to decode",
-                    }
-                },
-            },
-        ),
-        types.Tool(
-            name="compute_git_commit_sha",
-            description="Compute Github SHA-1 hash for content.",
-            inputSchema={
-                "type": "object",
-                "required": ["content"],
-                "properties": {
-                    "content": {
-                        "oneOf": [
-                            {
-                                "type": "string",
-                                "description": "String content to hash (will be UTF-8 encoded)"
-                            },
-                            {
-                                "type": "object",
-                                "description": "Bytes-like object to hash"
-                            }
-                        ],
-                        "description": "the string or bytes content to compute SHA-1 hash for",
-                    }
-                },
-            },
-        ),
-
-        types.Tool(
-            name="fetch_documentation_for_tool",
-            description="Fetch additional external documentation for a tool. Returns result as string.",
-            inputSchema={
-                "type": "object",
-                "required": ["tool_name"],
-                "properties": {
-                    "tool_name": {
-                        "type": "string",
-                        "description": "Name of the tool to fetch external documentation for",
-                    }
-                },
-            },
-        ),
-        # types.Tool(
-        #     name="fetch",
-        #     description="Fetches a website and returns its content",
-        #     inputSchema={
-        #         "type": "object",
-        #         "required": ["url"],
-        #         "properties": {
-        #             "url": {
-        #                 "type": "string",
-        #                 "description": "URL to fetch",
-        #             }
-        #         },
-        #     },
-        # )
-    ]
-
-    # Function to register new tools
-    def register_tool(langchain_tool, mcp_tool):
-        """Register a new tool dynamically"""
-        # Check if a tool with the same name already exists
-        for existing_tool in dynamic_tools:
-            if existing_tool.name == mcp_tool.name:
-                # Replace the existing tool
-                dynamic_tools.remove(existing_tool)
-                break
-        dynamic_tools.append(mcp_tool)
-        langchain_tools[mcp_tool.name] = langchain_tool
-
-    def encode_as_base64(content: Union[bytes, str]) -> str:
-        """Encode content as a base64 string."""
-        content = json.loads(content)['content']
-        print(f"Encoding content: {content}")
-        if isinstance(content, str):
-            content = content.encode('utf-8')
-        result = {}
-        result['base64result'] = base64.b64encode(content).decode("utf-8")
-        return json.dumps(result)
-
-    # Function to decode base64 to string
-    def decode_base64(encoded_content: str) -> str:
-        encoded_content = json.loads(encoded_content)['encoded_content']
-        print(f"Decoding content: {encoded_content}")
-
-        """Decode base64 encoded content to string."""
-        return base64.b64decode(encoded_content).decode("utf-8")
-
-    import hashlib
-
-    def compute_git_commit_sha(content: Union[bytes, str]) -> str:
-        """Compute Github SHA-1 hash for content."""
-        content = json.loads(content)['content']
-
-        if isinstance(content, str):
-            content_bytes = content.encode('utf-8')
-        else:
-            content_bytes = content
-        prefix = f"blob {len(content)}\0".encode()
-        sha1_hash = hashlib.sha1(prefix + content_bytes)
-        return sha1_hash.hexdigest()
-
-    # Create LangChain tools for the default tools
-    from langchain.tools import StructuredTool
-
-    # Create and register the encode_as_base64 tool, these are needed by GitHub repo operations.
-    encode_tool = StructuredTool.from_function(
-        func=encode_as_base64,
-        name="encode_as_base64",
-        description="Encode content as a base64 string.",
-        args_schema=create_input_schema_from_json_schema(default_tools[0].inputSchema)
-    )
-    register_tool(encode_tool, default_tools[0])
-
-    decode_tool = StructuredTool.from_function(
-        func=decode_base64,
-        name="decode_base64",
-        description="Decode base64 encoded content to string.",
-        args_schema=create_input_schema_from_json_schema(default_tools[1].inputSchema)
-    )
-    register_tool(decode_tool, default_tools[1])
-
-    # Create and register the compute_git_commit_sha tool
-    sha_tool = StructuredTool.from_function(
-        func=compute_git_commit_sha,
-        name="compute_git_commit_sha",
-        description="Compute Github SHA-1 hash for content.",
-        args_schema=create_input_schema_from_json_schema(default_tools[0].inputSchema)
-    )
-    register_tool(sha_tool, default_tools[2])
-
-    # Create and register the fetch_documentation_for_tool tool
-    docs_tool = StructuredTool.from_function(
-        coroutine=fetch_documentation_for_tool,
-        name="fetch_documentation_for_tool",
-        description="Fetch additional external documentation for a tool if available.",
-        args_schema=create_input_schema_from_json_schema(default_tools[1].inputSchema)
-    )
-    register_tool(docs_tool, default_tools[3])
-
-    @app.call_tool()
-    async def fetch_tool(
-            name: str, arguments: dict
-    ) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-        if name == "fetch":
-            if "url" not in arguments:
-                raise ValueError("Missing required argument 'url'")
-            return await fetch_website(arguments["url"])
-        elif name in langchain_tools:
-            # Handle dynamically registered tools
-            tool = langchain_tools[name]
-            try:
-                # Different approach: Use the tool's _parse_input method to handle the arguments
-                # This should properly format the arguments according to what the tool expects
-                parsed_input = None
-
-                # If the tool has a _parse_input method, use it
-                if hasattr(tool, '_parse_input'):
-                    try:
-                        # Some tools expect a string input, others expect a dict
-                        if hasattr(tool, 'args_schema'):
-                            parsed_input = tool._parse_input(arguments)
-                        else:
-                            # For tools without args_schema, try passing as string
-                            parsed_input = tool._parse_input(str(arguments))
-                    except Exception:
-                        # If parsing fails, try a different approach
-                        parsed_input = arguments
-                else:
-                    # No _parse_input method, use arguments directly
-                    parsed_input = arguments
-
-                # Use the proper tool execution methods
-                if hasattr(tool, 'arun'):
-                    # Handle async tools
-                    if isinstance(parsed_input, dict):
-                        if hasattr(tool, 'args_schema'):
-                            schema_props = tool.args_schema.schema().get('properties', {})
-                            filtered_args = {k: v for k, v in parsed_input.items() if k in schema_props}
-                            # Convert dict to string for tool_input
-                            tool_input = json.dumps(filtered_args)
-                            result = await tool.arun(tool_input=tool_input)
-                        else:
-                            result = await tool.arun(tool_input=str(parsed_input))
-                    else:
-                        result = await tool.arun(tool_input=parsed_input)
-                elif hasattr(tool, 'run'):
-                    # Handle sync tools, although we should deprecate and remove this
-                    if isinstance(parsed_input, dict):
-                        if hasattr(tool, 'args_schema'):
-                            schema_props = tool.args_schema.schema().get('properties', {})
-                            filtered_args = {k: v for k, v in parsed_input.items() if k in schema_props}
-                            # Convert dict to string for tool_input
-                            tool_input = json.dumps(filtered_args)
-                            result = tool.run(tool_input=tool_input)
-                        else:
-                            result = tool.run(tool_input=str(parsed_input))
-                    else:
-                        result = tool.run(tool_input=parsed_input)
-                elif hasattr(tool, 'func'):
-                    # For function-based tools
-                    if asyncio.iscoroutinefunction(tool.func):
-                        result = await tool.func(parsed_input)
-                    else:
-                        result = tool.func(parsed_input)
-                else:
-                    # Last resort
-                    result = str(tool(parsed_input))
-
-                # Return the result as text content
-                return [types.TextContent(type="text", text=str(result))]
-            except Exception as e:
-                print(f"Error executing tool {name}: {str(e)}")
-                traceback.print_exc()
-                raise ValueError(f"Error executing tool {name}: {str(e)}")
-        else:
-            raise ValueError(f"Unknown tool: {name}")
-
-    @app.list_tools()
-    async def list_tools() -> list[types.Tool]:
-        # Return both default and dynamically registered tools
-        return dynamic_tools
-
-    if transport == "sse":
-        from mcp.server.sse import SseServerTransport
-        from starlette.applications import Starlette
-        from starlette.routing import Mount, Route
-
-        sse = SseServerTransport("/messages/")
-
-        async def handle_sse(request):
-            async with sse.connect_sse(
-                    request.scope, request.receive, request._send
-            ) as streams:
-                await app.run(
-                    streams[0], streams[1], app.create_initialization_options()
-                )
-
-        starlette_app = Starlette(
-            debug=True,
-            routes=[
-                Route("/sse", endpoint=handle_sse),
-                Route("/load_openapi", endpoint=load_openapi),
-                Mount("/messages/", app=sse.handle_post_message),
-            ],
+            status_code=500,
         )
 
-        # Store the register_tool function in the app state for access in endpoints
-        starlette_app.state.register_tool = register_tool
+    tool_registry: ToolRegistry = request.app.state.tool_registry
+    tools_details = tool_registry.list_tools_with_details()
+    return JSONResponse({"tools": tools_details})
 
-        import uvicorn
-        uvicorn.run(starlette_app, host="127.0.0.1", port=port)
-    else:
-        from mcp.server.stdio import stdio_server
 
-        async def arun():
-            async with stdio_server() as streams:
-                await app.run(
-                    streams[0], streams[1], app.create_initialization_options()
-                )
+routes = [
+    Route("/load_openapi", endpoint=load_openapi, methods=["POST"]),
+    Route("/call_tool/{tool_name}", endpoint=call_tool_endpoint, methods=["POST"]),
+    Route("/list_tools", endpoint=list_tools_endpoint, methods=["GET"]),
+]
 
-        anyio.run(arun)
+app = Starlette(routes=routes, on_startup=[on_startup], on_shutdown=[on_shutdown])
 
-    return 0
+
+if __name__ == "__main__":
+    import uvicorn
+
+    # Basic logging setup
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
+    port_str = os.getenv("MCP_PORT", "8000")
+    try:
+        port = int(port_str)
+    except ValueError:
+        logger.error(f"Invalid MCP_PORT value: '{port_str}'. Defaulting to 8000.")
+        port = 8000
+
+    uvicorn.run(app, host="0.0.0.0", port=port)

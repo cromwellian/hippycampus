@@ -3,8 +3,8 @@
 import sys
 
 # Ensure the correct package name
-if 'hippycampus.hippycampus' in sys.modules:
-    del sys.modules['hippycampus.hippycampus']
+if "hippycampus.hippycampus" in sys.modules:
+    del sys.modules["hippycampus.hippycampus"]
 
 __package__ = "hippycampus"
 
